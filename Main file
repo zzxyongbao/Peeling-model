@@ -1,0 +1,991 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Elastoplastic Peeling Analysis GUI — v19
+
+Revised model following Chen Zhong's latest clarification:
+- no FPZ;
+- one elastic-foundation beam for x <= 0;
+- match y, dy/dx, and d2y/dx2 at x = 0;
+- film and adhesive foundation stiffnesses k1 and k2 act in series;
+- attached-region E' uses the requested film+adhesive series-modulus extension.
+
+Full revised boundary matching used here:
+    y_att(0)   = y_peel(0) = y0
+    y'_att(0)  = theta_r
+    y''_att(0) = K_m
+
+For the decaying elastic-foundation solution:
+    y(0)=A
+    y'(0)=beta(A+B)
+    y''(0)=2 beta^2 B
+
+Therefore automatic theta_r is obtained from:
+    K_e*kappa_m(P,phi,theta_r)
+    - 2 beta theta_r
+    + 2 beta^2 y0 = 0.
+
+Unlike v20, y(0) is NOT forced to zero.
+"""
+
+from __future__ import annotations
+import math
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from dataclasses import dataclass
+from pathlib import Path
+from datetime import datetime
+
+try:
+    from PIL import Image, ImageTk
+    PIL_OK = True
+except Exception:
+    PIL_OK = False
+
+
+@dataclass(frozen=True)
+class Film:
+    E: float
+    nu: float
+    sigma_y: float
+    alpha: float
+    b: float
+    h: float
+
+@dataclass(frozen=True)
+class Adhesive:
+    E: float
+    nu: float
+    b: float
+    h: float
+
+@dataclass
+class PeelResult:
+    theta: float
+    theta_deg: float
+    kappa_m: float
+    K_m: float
+    branch: str
+    R: float
+    external: float
+    bending: float
+    tensile: float
+    M_root: float
+
+@dataclass
+class AutoResult:
+    name: str
+    peel: PeelResult
+    beta: float
+    length_scale: float
+    K_foundation: float
+    residual: float
+    k1: float
+    k2: float | None
+    k_series: float
+    k_used: float
+    Eeq: float
+    nueq: float
+    Eprime_eq: float
+    I_f: float
+    D_att: float
+
+
+def deg(x): return x * math.pi / 180.0
+def rad2deg(x): return x * 180.0 / math.pi
+
+
+def check_nu(nu, label):
+    if not (-1.0 < nu < 0.5):
+        raise ValueError(f"{label} Poisson ratio must satisfy -1 < nu < 0.5.")
+
+
+def validate_film(f):
+    if f.E <= 0 or f.sigma_y <= 0 or f.b <= 0 or f.h <= 0:
+        raise ValueError("Film E, sigma_y, width and thickness must be positive.")
+    check_nu(f.nu, "Film")
+    if not (0 <= f.alpha < 1):
+        raise ValueError("Hardening alpha must satisfy 0 <= alpha < 1.")
+
+
+def validate_adhesive(a):
+    if a.h < 0:
+        raise ValueError("Adhesive thickness cannot be negative.")
+    check_nu(a.nu, "Adhesive")
+    if a.h > 0 and (a.E <= 0 or a.b <= 0):
+        raise ValueError("Adhesive E and width must be positive when h_a > 0.")
+
+
+# ---------- Latest foundation / attached-region model ----------
+
+def eq12_k(E, nu, b, h):
+    check_nu(nu, "Eq.12")
+    if E <= 0 or b <= 0 or h <= 0:
+        raise ValueError("Eq. (12) requires positive E, b and h.")
+    return E * (1-nu) / ((1+nu)*(1-2*nu)) * (2*b/h)
+
+
+def foundation_series(f, a):
+    k1 = eq12_k(f.E, f.nu, f.b, f.h)
+    if a.h == 0:
+        return k1, None, k1
+    k2 = eq12_k(a.E, a.nu, a.b, a.h)
+    return k1, k2, k1*k2/(k1+k2)
+
+
+def attached_properties(f, a):
+    if a.h == 0:
+        Eeq = f.E
+        nueq = f.nu
+    else:
+        Eeq = (f.h+a.h) / (f.h/f.E + a.h/a.E)
+        # Explicit engineering closure: thickness-weighted nu.
+        nueq = (f.nu*f.h + a.nu*a.h) / (f.h+a.h)
+    check_nu(nueq, "Equivalent")
+    Eprime = Eeq / (1-nueq**2)
+    I_f = f.b * f.h**3 / 12
+    D_att = Eprime * I_f
+    return Eeq, nueq, Eprime, I_f, D_att
+
+
+# ---------- Chen peeled-arm elastoplastic mechanics ----------
+
+def Me(f):
+    return f.sigma_y*f.b*f.h**2 / (6*math.sqrt(1-f.nu+f.nu**2))
+
+
+def Ke(f):
+    return (
+        f.sigma_y/(f.E*f.h)
+        * 2*(1-f.nu**2)
+        / math.sqrt(1-f.nu+f.nu**2)
+    )
+
+
+def eta(f, P):
+    return 6*f.E*P/(f.sigma_y**2*f.b*f.h)
+
+
+def reverse_threshold(alpha):
+    return (2-alpha)/(1-alpha)
+
+
+def m_loading(kappa, alpha):
+    if kappa <= 1:
+        return kappa
+    return (1-alpha)/2*(3-1/kappa**2) + alpha*kappa
+
+
+def eq5b_residual(k, et, angle_term, alpha):
+    a = alpha
+    return (
+        a*((1-a)*k-(2-a))**2*k
+        +(1-a)**2*(2-a)*k**2
+        -2*(1-a)*(2-a)**2*k
+        -et*k*angle_term
+        +(2-a)**3
+        +(2-a)*(k-1)*(a*k+2-a)*k
+    )
+
+
+def bisect(fun, lo, hi, tol=1e-11, max_iter=300):
+    flo, fhi = fun(lo), fun(hi)
+    if flo == 0: return lo
+    if fhi == 0: return hi
+    if flo*fhi > 0:
+        raise ValueError("Root is not bracketed.")
+    for _ in range(max_iter):
+        mid = (lo+hi)/2
+        fm = fun(mid)
+        if abs(fm) < 1e-13 or abs(hi-lo) < tol*max(1, abs(mid)):
+            return mid
+        if flo*fm <= 0:
+            hi, fhi = mid, fm
+        else:
+            lo, flo = mid, fm
+    return (lo+hi)/2
+
+
+def peak_kappa(f, P, phi, theta):
+    angle_term = max(0.0, 1-math.cos(phi-theta))
+    et = eta(f, P)
+    trial = math.sqrt(max(0.0, et*angle_term))
+    krev = reverse_threshold(f.alpha)
+
+    if trial <= krev + 1e-12:
+        return trial, ("elastic" if trial <= 1+1e-12 else "forward_plastic")
+
+    fun = lambda k: eq5b_residual(k, et, angle_term, f.alpha)
+    lo = krev
+    upper = max(trial*1.5, krev+1)
+    for _ in range(12):
+        px, pf = lo, fun(lo)
+        for i in range(1, 1000):
+            x = lo + (upper-lo)*i/999
+            fx = fun(x)
+            if pf*fx <= 0:
+                return bisect(fun, px, x), "reverse_plastic"
+            px, pf = x, fx
+        upper *= 2
+    raise ValueError("Could not solve Chen Eq. (5b).")
+
+
+def bending_integral(k, alpha):
+    if k <= 1:
+        return 0.0
+    krev = reverse_threshold(alpha)
+    if k <= krev:
+        return (1-alpha)/2*(2/k + k**2 - 3)
+    return 0.5 * (
+        (1-alpha)*(
+            alpha*(2-alpha)*k**2
+            +3*(1-alpha)*(2-alpha)*k
+            -3*(5-4*alpha+alpha**2)
+        )
+        +((2-alpha)**3 + 2*(1-alpha))/k
+    )
+
+
+def peel_result(f, P, phi, theta):
+    km, branch = peak_kappa(f, P, phi, theta)
+    Km = Ke(f) * km
+    Mroot = Me(f) * m_loading(km, f.alpha)
+
+    eps_t = P/(f.E*f.b*f.h)
+    external = (P/f.b)*(1-math.cos(phi)+eps_t)
+    bending = f.sigma_y**2*f.h/(3*f.E) * bending_integral(km, f.alpha)
+    tensile = f.h*0.5*f.E*eps_t**2
+    R = external - bending - tensile
+
+    return PeelResult(
+        theta, rad2deg(theta), km, Km, branch,
+        R, external, bending, tensile, Mroot
+    )
+
+
+# ---------- Revised automatic theta_r ----------
+
+def solve_auto(f, a, P, phi):
+    """
+    Solve theta_r and y(0) automatically.
+
+    Attached decaying solution:
+        y(x) = exp(beta*x)[A cos(beta*x) + B sin(beta*x)]
+
+    At x=0:
+        y(0)   = A
+        y'(0)  = beta(A+B) = theta_r
+        y''(0) = 2 beta^2 B = K_m(theta_r)
+
+    Therefore:
+        B  = K_m/(2 beta^2)
+        y0 = theta_r/beta - K_m/(2 beta^2)
+
+    The third derivative is:
+        y'''(0) = 2 beta*K_m - 2 beta^2*theta_r
+
+    External transverse-force equilibrium determines theta_r.
+
+    Final v25 convention:
+        V_peel = P sin(phi)
+
+    This uses the same fixed global x-y coordinate system as the
+    elastic-foundation beam equation.
+
+    Chen Zhong's revised matching quantities remain y, y', and y''.
+    The force equation is used as an external boundary condition,
+    not as a fourth matching quantity.
+    """
+    validate_film(f)
+    validate_adhesive(a)
+
+    Eeq, nueq, Eprime, I_f, D_att = attached_properties(f, a)
+    k1, k2, kseries = foundation_series(f, a)
+    # v26 final foundation model: k1 and k2 are always in series.
+    k_used = kseries
+    name = "Series k1-k2 foundation"
+    beta = (k_used/(4*D_att))**0.25
+
+    def state(theta):
+        p = peel_result(f, P, phi, theta)
+        Km = p.K_m
+        B = Km/(2*beta**2)
+        y0 = theta/beta - B
+        A = y0
+
+        yp = beta*(A+B)
+        ypp = 2*beta**2*B
+        yppp = 2*beta**3*(B-A)
+
+        V_att = D_att*yppp
+        # Final v25 convention: global transverse-force component.
+        V_peel = P*math.sin(phi)
+
+        return p, A, B, y0, yp, ypp, yppp, V_att, V_peel, V_att-V_peel
+
+    eps = max(1e-10, phi*1e-9)
+    lo, hi = eps, phi-eps
+    prev_t = lo
+    prev_r = state(lo)[-1]
+    brackets = []
+
+    for i in range(1, 4001):
+        th = lo + (hi-lo)*i/4000
+        r = state(th)[-1]
+        if math.isfinite(prev_r) and math.isfinite(r) and prev_r*r <= 0:
+            brackets.append((prev_t, th))
+        prev_t, prev_r = th, r
+
+    if not brackets:
+        raise ValueError(
+            "No automatic root-angle solution was found from transverse-force "
+            "equilibrium in 0 < theta_r < phi."
+        )
+
+    theta = bisect(lambda th: state(th)[-1], *brackets[0])
+    p, A, B, y0, yp, ypp, yppp, V_att, V_peel, force_res = state(theta)
+
+    result = AutoResult(
+        name=name,
+        peel=p,
+        beta=beta,
+        length_scale=1/beta,
+        K_foundation=ypp,
+        residual=p.K_m-ypp,
+        k1=k1,
+        k2=k2,
+        k_series=kseries,
+        k_used=k_used,
+        Eeq=Eeq,
+        nueq=nueq,
+        Eprime_eq=Eprime,
+        I_f=I_f,
+        D_att=D_att,
+    )
+
+    result.A = A
+    result.B = B
+    result.y0 = y0
+    result.slope_foundation = yp
+    result.slope_residual = theta-yp
+    result.yppp0 = yppp
+    result.V_att = V_att
+    result.V_peel = V_peel
+    result.force_residual = force_res
+    result.all_root_count = len(brackets)
+    return result
+
+
+# ---------- GUI ----------
+
+BG="#08111f"; PANEL="#101c2f"; PANEL2="#13243b"
+TEXT="#e9f2ff"; MUTED="#9db0c7"; ACC="#54d4ff"; GOOD="#77ffb7"; WARN="#ffcf66"
+
+
+class Scroll(tk.Frame):
+    def __init__(self, master):
+        super().__init__(master, bg=PANEL)
+        c = tk.Canvas(self, bg=PANEL, highlightthickness=0)
+        s = ttk.Scrollbar(self, orient="vertical", command=c.yview)
+        self.inner = tk.Frame(c, bg=PANEL)
+        w = c.create_window((0,0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", lambda e: c.configure(scrollregion=c.bbox("all")))
+        c.bind("<Configure>", lambda e: c.itemconfigure(w, width=e.width))
+        c.configure(yscrollcommand=s.set)
+        c.pack(side="left", fill="both", expand=True)
+        s.pack(side="right", fill="y")
+
+
+def section(parent, title):
+    f = tk.LabelFrame(
+        parent, text=title, bg=PANEL2, fg=ACC,
+        font=("Segoe UI",10,"bold"), padx=9, pady=7
+    )
+    f.pack(fill="x", padx=9, pady=5)
+    return f
+
+
+def field(parent, label, var, unit, row):
+    tk.Label(parent,text=label,bg=PANEL2,fg=TEXT).grid(row=row,column=0,sticky="w",pady=3)
+    tk.Entry(parent,textvariable=var,bg="#0b1728",fg=TEXT,insertbackground=TEXT,relief="flat").grid(
+        row=row,column=1,sticky="ew",padx=6
+    )
+    tk.Label(parent,text=unit,bg=PANEL2,fg=MUTED).grid(row=row,column=2,sticky="w")
+    parent.grid_columnconfigure(1,weight=1)
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Elastoplastic Peeling Analysis — v28 Revised No-FPZ")
+        self.geometry("1500x900")
+        self.minsize(1150,720)
+        self.configure(bg=BG)
+
+        st=ttk.Style(self)
+        try: st.theme_use("clam")
+        except Exception: pass
+        st.configure("Treeview",background="#0b1728",foreground=TEXT,fieldbackground="#0b1728",rowheight=25)
+        st.configure("Treeview.Heading",background="#162a45",foreground=TEXT)
+
+        self.photo=None
+        self.last_results = None
+        self.last_inputs = None
+        self.output_visible = True
+        self.header()
+        self.body()
+        self.example()
+
+    def header(self):
+        h=tk.Frame(self,bg=BG,height=205)
+        h.pack(fill="x",padx=12,pady=8)
+        h.pack_propagate(False)
+
+        img=Path(__file__).with_name("peel_principle_diagram_v25.png")
+        if PIL_OK and img.exists():
+            try:
+                im=Image.open(img).convert("RGB")
+                scale=min(700/im.width,175/im.height)
+                im=im.resize((int(im.width*scale),int(im.height*scale)),Image.LANCZOS)
+                self.photo=ImageTk.PhotoImage(im)
+                tk.Label(h,image=self.photo,bg="white").pack(side="left",padx=8)
+            except Exception:
+                pass
+
+        r=tk.Frame(h,bg=BG)
+        r.pack(side="right",fill="both",expand=True,padx=18)
+
+        # Top-right command area requested by user.
+        cmd=tk.Frame(r,bg=BG)
+        cmd.pack(side="top",fill="x",anchor="ne",pady=(4,0))
+
+        button_cfg=dict(
+            relief="flat",
+            font=("Segoe UI",9,"bold"),
+            padx=11,
+            pady=7,
+            cursor="hand2",
+        )
+
+        calc_cfg=dict(button_cfg)
+        calc_cfg.update({
+            "font":("Segoe UI",12,"bold"),
+            "padx":24,
+            "pady":12,
+        })
+        tk.Button(
+            cmd,text="CALCULATE",command=self.calculate,
+            bg=ACC,fg="#03111a",**calc_cfg
+        ).pack(side="right",padx=(10,0))
+
+        tk.Button(
+            cmd,text="LOAD EXAMPLE",command=self.example,
+            bg="#173654",fg=TEXT,**button_cfg
+        ).pack(side="right",padx=(6,0))
+
+        tk.Button(
+            cmd,text="EXPORT EXCEL",command=self.export_excel,
+            bg="#1f6f55",fg=TEXT,**button_cfg
+        ).pack(side="right",padx=(6,0))
+
+        self.output_button=tk.Button(
+            cmd,text="CLEAR OUTPUT",command=self.clear_output,
+            bg="#5a456f",fg=TEXT,**button_cfg
+        )
+        self.output_button.pack(side="right",padx=(6,0))
+
+        title=tk.Frame(r,bg=BG)
+        title.pack(side="top",fill="both",expand=True)
+        tk.Label(
+            title,text="ELASTOPLASTIC PEELING\nANALYSIS",
+            bg=BG,fg=TEXT,font=("Segoe UI",22,"bold"),justify="left"
+        ).pack(anchor="w",pady=(24,3))
+        tk.Label(
+            title,text="v28 • Series k1-k2 foundation • Clear Output fixed",
+            bg=BG,fg=ACC,font=("Segoe UI",11,"bold")
+        ).pack(anchor="w")
+        tk.Label(
+            title,text="Boundary match at x=0: y, y', y'' • No FPZ",
+            bg=BG,fg=MUTED,font=("Segoe UI",10)
+        ).pack(anchor="w",pady=(4,0))
+
+    def body(self):
+        p=tk.PanedWindow(self,orient="horizontal",bg=BG,sashwidth=6)
+        p.pack(fill="both",expand=True,padx=12,pady=(0,12))
+        L=Scroll(p); R=Scroll(p)
+        p.add(L,minsize=430); p.add(R,minsize=650)
+        self.inputs(L.inner); self.results(R.inner)
+
+    def inputs(self,p):
+        s=section(p,"Foundation Model")
+        tk.Label(
+            s,
+            text="Latest model: k1 (film) and k2 (adhesive) in series. No FPZ, sigma_f, delta_f or a_f.",
+            bg=PANEL2,fg=WARN,wraplength=390,justify="left"
+        ).pack(anchor="w",pady=(5,0))
+        tk.Label(
+            s,
+            text=("LOAD EXAMPLE uses the Chen (2002) reference film properties; "
+                  "adhesive values remain the later series-foundation extension."),
+            bg=PANEL2,fg=MUTED,wraplength=390,justify="left"
+        ).pack(anchor="w",pady=(5,0))
+
+        s=section(p,"Film")
+        self.E=tk.StringVar(); self.nu=tk.StringVar(); self.sy=tk.StringVar()
+        self.alpha=tk.StringVar(); self.b=tk.StringVar(); self.h=tk.StringVar()
+        for i,(l,v,u) in enumerate([
+            ("Young's modulus E_f",self.E,"GPa"),
+            ("Poisson ratio nu_f",self.nu,"–"),
+            ("Yield stress sigma_y",self.sy,"MPa"),
+            ("Hardening alpha",self.alpha,"–"),
+            ("Width b_f",self.b,"mm"),
+            ("Thickness h_f",self.h,"um"),
+        ]):
+            field(s,l,v,u,i)
+
+        s=section(p,"Adhesive")
+        self.Ea=tk.StringVar(); self.nua=tk.StringVar(); self.ba=tk.StringVar(); self.ha=tk.StringVar()
+        for i,(l,v,u) in enumerate([
+            ("Young's modulus E_a",self.Ea,"GPa"),
+            ("Poisson ratio nu_a",self.nua,"–"),
+            ("Width b_a",self.ba,"mm"),
+            ("Thickness h_a",self.ha,"um"),
+        ]):
+            field(s,l,v,u,i)
+
+        s=section(p,"Peel Test")
+        self.P=tk.StringVar(); self.phi=tk.StringVar()
+        for i,(l,v,u) in enumerate([
+            ("Peel force P",self.P,"N"),
+            ("Peel angle phi",self.phi,"deg"),
+        ]):
+            field(s,l,v,u,i)
+
+        s=section(p,"Automatic Boundary Solver")
+        tk.Label(
+            s,
+            text=(
+                "Final v25 formulation: revised Chen matching uses y, y', y'' at x=0. "
+                "The external transverse-force boundary condition is fixed as "
+                "V(0)=P sin(phi) in the global elastic-foundation coordinate system."
+            ),
+            bg=PANEL2,fg=GOOD,wraplength=390,justify="left"
+        ).pack(anchor="w",pady=(0,6))
+        tk.Label(
+            s,
+            text=(
+                "The program automatically solves theta_r and y(0). "
+                "The previous P sin(phi-theta_r) option has been removed."
+            ),
+            bg=PANEL2,fg=WARN,wraplength=390,justify="left"
+        ).pack(anchor="w")
+
+    def results(self,p):
+        s=section(p,"Primary Result")
+        self.primary=tk.Label(
+            s,text="Ready.",bg=PANEL2,fg=GOOD,
+            font=("Consolas",12,"bold"),justify="left"
+        )
+        self.primary.pack(anchor="w")
+
+        s=section(p,"Model Comparison")
+        cols=("model","theta","kappa","k","beta","length","R","resid")
+        self.tree=ttk.Treeview(s,columns=cols,show="headings",height=6)
+        heads=[
+            "Model","theta [deg]","kappa_m","k [N/m²]",
+            "beta [1/m]","1/beta [mm]","R [J/m²]","K residual"
+        ]
+        widths=[195,100,95,120,105,100,95,115]
+        for c,h,w in zip(cols,heads,widths):
+            self.tree.heading(c,text=h)
+            self.tree.column(c,width=w,anchor="center")
+        self.tree.pack(fill="x")
+
+        self.output_section=section(p,"Detailed Output")
+        self.txt=tk.Text(
+            self.output_section,height=32,bg="#0b1728",fg=TEXT,
+            insertbackground=TEXT,relief="flat",
+            font=("Consolas",10),wrap="word"
+        )
+        self.txt.pack(fill="both",expand=True)
+
+    def example(self):
+        # Paper-based defaults:
+        # Chen (2002) Figure-3/reference set: E=4 GPa, nu=0.40,
+        # sigma_y=100 MPa, alpha=0.05, R=100 J/m^2 and h/r_y=10.
+        # Eq. (13) gives h ≈ 50.53 um for that reference set.
+        #
+        # The adhesive layer is the later series-foundation extension and is
+        # not specified by Chen (2002), so the previously agreed adhesive
+        # reference values are retained here.
+        vals=[
+            (self.E,"0.4"),(self.nu,"0.40"),(self.sy,"100"),(self.alpha,"0.05"),
+            (self.b,"10"),(self.h,"50.53"),(self.Ea,"1.0"),(self.nua,"0.44"),
+            (self.ba,"10"),(self.ha,"10"),(self.P,"0.5"),(self.phi,"90"),
+        ]
+        for v,x in vals:
+            v.set(x)
+
+    def parse(self):
+        f=Film(
+            float(self.E.get())*1e9,float(self.nu.get()),float(self.sy.get())*1e6,
+            float(self.alpha.get()),float(self.b.get())*1e-3,float(self.h.get())*1e-6
+        )
+        a=Adhesive(
+            float(self.Ea.get())*1e9,float(self.nua.get()),
+            float(self.ba.get())*1e-3,float(self.ha.get())*1e-6
+        )
+        validate_film(f)
+        validate_adhesive(a)
+        P=float(self.P.get())
+        phi=deg(float(self.phi.get()))
+        if P<0:
+            raise ValueError("Peel force cannot be negative.")
+        if not (0<phi<=math.pi):
+            raise ValueError("Peel angle must be in (0,180] deg.")
+        return f,a,P,phi
+
+    def clear(self):
+        for item in self.tree.get_children(): self.tree.delete(item)
+        self.txt.delete("1.0","end")
+
+    def calculate(self):
+        try:
+            f,a,P,phi=self.parse()
+            self.clear()
+
+            # v26: only the k1-k2 series foundation is used.
+            results=[solve_auto(f,a,P,phi)]
+
+            for r in results:
+                self.tree.insert("", "end", values=(
+                    r.name,f"{r.peel.theta_deg:.8f}",f"{r.peel.kappa_m:.8f}",
+                    f"{r.k_used:.6e}",f"{r.beta:.6e}",f"{r.length_scale*1e3:.6f}",
+                    f"{r.peel.R:.6f}",f"{r.residual:.3e}"
+                ))
+
+            r=results[0]
+            self.primary.config(text=(
+                f"theta_r = {r.peel.theta_deg:.8f} deg\n"
+                f"kappa_m = {r.peel.kappa_m:.8f}\n"
+                f"K_m = {r.peel.K_m:.6e} 1/m\n"
+                f"y(0) = {r.y0*1e6:.6f} um\n"
+                f"R = {r.peel.R:.6f} J/m²"
+            ))
+
+            summary=self.detail_auto(results)
+            self.txt.insert("1.0",summary)
+
+            self.last_results=results
+            self.last_inputs={
+                "film":f,
+                "adhesive":a,
+                "P":P,
+                "phi":phi,
+                "timestamp":datetime.now(),
+                "summary":summary,
+            }
+
+        except Exception as e:
+            messagebox.showerror("Calculation error",str(e))
+
+
+    def clear_output(self):
+        """Clear all visible calculation output and reset stored calculation state."""
+        # Clear the detailed text output.
+        self.txt.delete("1.0", "end")
+
+        # Reset the primary result area.
+        self.primary.config(text="Ready.")
+
+        # Clear the model-comparison/result table.
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        # Clear stored state so stale results cannot be exported.
+        self.last_results = None
+        self.last_inputs = None
+
+
+    def export_excel(self):
+        if not self.last_results or not self.last_inputs:
+            messagebox.showinfo(
+                "Export Excel",
+                "Please run CALCULATE first, then export the current results."
+            )
+            return
+
+        default_name="peeling_results_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".xlsx"
+        path=filedialog.asksaveasfilename(
+            title="Export calculation results to Excel",
+            defaultextension=".xlsx",
+            initialfile=default_name,
+            filetypes=[("Excel Workbook","*.xlsx")]
+        )
+        if not path:
+            return
+
+        try:
+            self._write_excel_file(path)
+            messagebox.showinfo("Export Excel",f"Excel file exported successfully:\n{path}")
+        except ModuleNotFoundError:
+            messagebox.showerror(
+                "Excel export dependency missing",
+                "Excel export requires the 'xlsxwriter' package.\n\n"
+                "Install it once with:\n"
+                "pip install xlsxwriter"
+            )
+        except Exception as exc:
+            messagebox.showerror("Export Excel",str(exc))
+
+    def _write_excel_file(self,path):
+        # Lazy import: GUI calculation does not require this optional dependency.
+        import xlsxwriter
+
+        data=self.last_inputs
+        results=self.last_results
+        f=data["film"]
+        a=data["adhesive"]
+
+        wb=xlsxwriter.Workbook(path)
+        ws=wb.add_worksheet("Peeling Results")
+
+        title_fmt=wb.add_format({
+            "bold":True,"font_size":16,"font_color":"#FFFFFF",
+            "bg_color":"#173654","align":"center","valign":"vcenter"
+        })
+        section_fmt=wb.add_format({
+            "bold":True,"font_color":"#FFFFFF","bg_color":"#1F4E78",
+            "border":1
+        })
+        header_fmt=wb.add_format({
+            "bold":True,"font_color":"#FFFFFF","bg_color":"#4472C4",
+            "border":1,"align":"center"
+        })
+        label_fmt=wb.add_format({"bold":True,"bg_color":"#D9EAF7","border":1})
+        value_fmt=wb.add_format({"border":1,"num_format":"0.000000000"})
+        sci_fmt=wb.add_format({"border":1,"num_format":"0.000000E+00"})
+        text_fmt=wb.add_format({"border":1})
+        wrap_fmt=wb.add_format({"text_wrap":True,"valign":"top","border":1})
+
+        ws.merge_range("A1:H2","Elastoplastic Peeling Analysis — v28 Results",title_fmt)
+        ws.set_row(0,22)
+        ws.set_column("A:A",28)
+        ws.set_column("B:B",18)
+        ws.set_column("C:H",18)
+
+        row=3
+        ws.write(row,0,"Run Information",section_fmt); row+=1
+        info=[
+            ("Timestamp",data["timestamp"].strftime("%Y-%m-%d %H:%M:%S")),
+            ("Model","Revised Chen elastic foundation — No FPZ"),
+            ("Boundary matching","y, y', y'' at x=0"),
+            ("Root-angle mode","Automatic only"),
+        ]
+        for label,val in info:
+            ws.write(row,0,label,label_fmt); ws.write(row,1,val,text_fmt); row+=1
+
+        row+=1
+        ws.write(row,0,"Input Parameters",section_fmt); row+=1
+        inputs=[
+            ("Film E_f [GPa]",f.E/1e9),
+            ("Film nu_f [-]",f.nu),
+            ("Film sigma_y [MPa]",f.sigma_y/1e6),
+            ("Hardening alpha [-]",f.alpha),
+            ("Film width b_f [mm]",f.b*1e3),
+            ("Film thickness h_f [um]",f.h*1e6),
+            ("Adhesive E_a [GPa]",a.E/1e9),
+            ("Adhesive nu_a [-]",a.nu),
+            ("Adhesive width b_a [mm]",a.b*1e3),
+            ("Adhesive thickness h_a [um]",a.h*1e6),
+            ("Peel force P [N]",data["P"]),
+            ("Peel angle phi [deg]",rad2deg(data["phi"])),
+            ("External force boundary","V = P sin(phi)"),
+        ]
+        for label,val in inputs:
+            ws.write(row,0,label,label_fmt)
+            if isinstance(val,(int,float)):
+                ws.write_number(row,1,float(val),value_fmt)
+            else:
+                ws.write(row,1,str(val),text_fmt)
+            row+=1
+
+        row+=1
+        ws.write(row,0,"Calculation Results",section_fmt); row+=1
+        headers=[
+            "Model","theta_r [deg]","kappa_m","K_m [1/m]",
+            "k [N/m^2]","beta [1/m]","1/beta [mm]","R [J/m^2]"
+        ]
+        for col,h in enumerate(headers):
+            ws.write(row,col,h,header_fmt)
+        row+=1
+
+        for r in results:
+            vals=[
+                r.name,r.peel.theta_deg,r.peel.kappa_m,r.peel.K_m,
+                r.k_used,r.beta,r.length_scale*1e3,r.peel.R
+            ]
+            ws.write(row,0,vals[0],text_fmt)
+            for c,val in enumerate(vals[1:],start=1):
+                ws.write_number(row,c,float(val),sci_fmt if c in (3,4,5) else value_fmt)
+            row+=1
+
+        primary=results[0]
+        row+=1
+        ws.write(row,0,"Primary Series-Foundation Details",section_fmt); row+=1
+        details=[
+            ("k1 film [N/m^2]",primary.k1),
+            ("k2 adhesive [N/m^2]",primary.k2 if primary.k2 is not None else None),
+            ("k_series [N/m^2]",primary.k_series),
+            ("E_eq [GPa]",primary.Eeq/1e9),
+            ("nu_eq [-]",primary.nueq),
+            ("E'_eq [GPa]",primary.Eprime_eq/1e9),
+            ("I_f [m^4]",primary.I_f),
+            ("D_att [N m^2]",primary.D_att),
+            ("Root displacement y(0) [um]",primary.y0*1e6),
+            ("Foundation constant A [m]",primary.A),
+            ("Foundation constant B [m]",primary.B),
+            ("Foundation slope y'(0) [rad]",primary.slope_foundation),
+            ("Slope residual [rad]",primary.slope_residual),
+            ("third derivative y'''(0) [1/m^2]",primary.yppp0),
+            ("V_att [N]",primary.V_att),
+            ("V_peel [N]",primary.V_peel),
+            ("Force residual [N]",primary.force_residual),
+            ("K_foundation [1/m]",primary.K_foundation),
+            ("Curvature residual [1/m]",primary.residual),
+            ("External work [J/m^2]",primary.peel.external),
+            ("Bending work [J/m^2]",primary.peel.bending),
+            ("Tensile work [J/m^2]",primary.peel.tensile),
+            ("M_root [N m]",primary.peel.M_root),
+        ]
+        for label,val in details:
+            ws.write(row,0,label,label_fmt)
+            if val is None:
+                ws.write(row,1,"N/A",text_fmt)
+            else:
+                ws.write_number(row,1,float(val),sci_fmt if abs(float(val))>=1e5 or (abs(float(val))<1e-4 and val!=0) else value_fmt)
+            row+=1
+
+        row+=1
+        ws.write(row,0,"Detailed Output",section_fmt); row+=1
+        ws.merge_range(row,0,row+18,7,data["summary"],wrap_fmt)
+        ws.set_row(row,220)
+
+        ws.freeze_panes(3,0)
+        wb.close()
+
+    def detail_auto(self,results):
+        r=results[0]
+        lines=[
+            "REVISED CHEN ELASTIC-FOUNDATION MODEL — NO FPZ",
+            "===============================================",
+            "",
+            "FOUNDATION",
+            f"k1 film          = {r.k1:.9e} N/m²",
+            ("k2 adhesive      = N/A (h_a=0)" if r.k2 is None else f"k2 adhesive      = {r.k2:.9e} N/m²"),
+            f"k series         = {r.k_series:.9e} N/m²",
+            "",
+            "ATTACHED-REGION MODULUS",
+            f"E_eq             = {r.Eeq/1e9:.9f} GPa",
+            f"nu_eq            = {r.nueq:.9f}  [engineering estimate]",
+            f"E'_eq            = {r.Eprime_eq/1e9:.9f} GPa",
+            f"I_f              = {r.I_f:.9e} m^4",
+            f"D_att            = {r.D_att:.9e} N·m²",
+            "",
+            "FULL MATCH AT x=0",
+            f"y_att(0)=y_peel(0)  = {r.y0*1e6:.9f} um  [solved]",
+            f"A = y(0)             = {r.A:.9e} m",
+            f"B                     = {r.B:.9e} m",
+            f"y'(0) foundation     = {r.slope_foundation:.9e} rad",
+            f"theta_r peeled       = {r.peel.theta:.9e} rad = {r.peel.theta_deg:.9f} deg",
+            f"slope residual        = {r.slope_residual:.9e} rad",
+            f"y''(0) foundation    = {r.K_foundation:.9e} 1/m",
+            f"K_m peeled           = {r.peel.K_m:.9e} 1/m",
+            f"curvature residual   = {r.residual:.9e} 1/m",
+            "",
+            "EXTERNAL TRANSVERSE-FORCE BOUNDARY",
+            "force boundary        = V = P sin(phi) [global]",
+            f"third derivative y'''(0) = {r.yppp0:.9e} 1/m^2",
+            f"V_att = D*y'''        = {r.V_att:.9e} N",
+            f"V_peel                = {r.V_peel:.9e} N",
+            f"force residual         = {r.force_residual:.9e} N",
+            f"number of theta roots  = {r.all_root_count}",
+            "",
+            f"beta             = {r.beta:.9e} 1/m",
+            f"1/beta           = {r.length_scale*1e3:.9f} mm",
+            "",
+            "PEELED ARM",
+            f"kappa_m          = {r.peel.kappa_m:.12g}",
+            f"branch           = {r.peel.branch}",
+            f"M_root           = {r.peel.M_root:.9e} N·m",
+            f"external work    = {r.peel.external:.9f} J/m²",
+            f"bending work     = {r.peel.bending:.9f} J/m²",
+            f"tensile work     = {r.peel.tensile:.9f} J/m²",
+            f"R                = {r.peel.R:.9f} J/m²",
+            "",
+            "AUTOMATIC SOLVER",
+            "1) y''(0) = K_m(theta_r)",
+            "2) y'(0) = theta_r",
+            "3) V_att(0) = V_peel determines theta_r",
+            "4) y(0)=theta_r/beta-K_m/(2 beta^2) is then obtained",
+            "",
+            "Removed in v22: FPZ, sigma_f, delta_f, a_f and all FPZ inversion modes.",
+        ]
+        if len(results)>1:
+            q=results[1]
+            lines += [
+                "",
+                "FILM-ONLY k1 REFERENCE",
+                f"theta_r          = {q.peel.theta_deg:.9f} deg",
+                f"kappa_m          = {q.peel.kappa_m:.9f}",
+                f"R                = {q.peel.R:.9f} J/m²",
+            ]
+        return "\n".join(lines)
+
+
+
+def self_test():
+    f=Film(4e9,0.40,100e6,0.05,10e-3,50e-6)
+    a=Adhesive(0.10e9,0.44,10e-3,10e-6)
+
+    k1,k2,ks=foundation_series(f,a)
+    assert k2 is not None and ks<k1 and ks<k2
+
+    Eeq,nueq,Ep,I,D=attached_properties(f,a)
+    assert abs(Eeq/1e9-0.5333333333333333)<1e-12
+
+    r=solve_auto(f,a,0.5,deg(90))
+    assert 0<r.peel.theta<deg(90)
+    assert abs(r.residual)<1e-6
+    assert abs(r.slope_residual)<1e-9
+    assert abs(r.force_residual)<1e-8
+    assert math.isfinite(r.y0)
+
+    known=peel_result(f,0.5,deg(90),deg(6))
+    assert abs(known.R-39.845289778749176)<1e-8
+
+    a0=Adhesive(0.1e9,0.44,10e-3,0.0)
+    k10,k20,ks0=foundation_series(f,a0)
+    assert k20 is None and abs(k10-ks0)/k10<1e-14
+
+    return {
+        "k1_N_m2":k1,
+        "k2_N_m2":k2,
+        "k_series_N_m2":ks,
+        "Eeq_GPa":Eeq/1e9,
+        "nueq":nueq,
+        "auto_theta_deg":r.peel.theta_deg,
+        "auto_kappa_m":r.peel.kappa_m,
+        "auto_R_J_m2":r.peel.R,
+        "curvature_residual_1_m":r.residual,
+        "known_R_J_m2":known.R,
+    }
+
+
+if __name__=="__main__":
+    import sys
+    if "--self-test" in sys.argv:
+        for k,v in self_test().items():
+            print(f"{k} = {v}")
+    else:
+        App().mainloop()
