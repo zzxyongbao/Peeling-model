@@ -21,34 +21,101 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-      .block-container {padding-top: 1.1rem; padding-bottom: 2rem; max-width: 1500px;}
-      h1 {letter-spacing: .02em; margin-bottom: .1rem;}
-      div[data-testid="stButton"] > button {
+     /* 整个网页背景 */
+    .stApp {
+        background-color: #FFFFFF;
+        color: #111827;
+    }
+
+    /* 主页面宽度 */
+    .block-container {
+        padding-top: 1.1rem;
+        padding-bottom: 2rem;
+        max-width: 1500px;
+    }
+
+    /* 主标题 */
+    h1 {
+        color: #17365D;
+        font-weight: 800;
+    }
+
+    h2, h3, h4 {
+        color: #244062;
+    }
+
+    /* 普通文字 */
+    p, label, span {
+        color: #111827;
+    }
+
+    /* 按钮 */
+    div[data-testid="stButton"] > button,
+    div[data-testid="stDownloadButton"] > button {
         min-height: 3rem;
         font-weight: 700;
         border-radius: 8px;
-      }
-      div[data-testid="stMetric"] {
-        background: #13243b;
-        border: 1px solid rgba(84,212,255,.20);
-        border-radius: 10px;
-        padding: 10px 14px;
-      }
-      .model-note {
-        border: 1px solid rgba(84,212,255,.20);
-        background: #101c2f;
+    }
+
+    /* 输入框 */
+    div[data-baseweb="input"] {
+        background-color: #FFFFFF;
+    }
+
+    input {
+        background-color: #FFFFFF !important;
+        color: #111827 !important;
+    }
+
+    /* 结果卡片 */
+    div[data-testid="stMetric"] {
+        background: #FFFFFF;
+        border: 2px solid #2F75B5;
+        border-radius: 12px;
+        padding: 14px 16px;
+        box-shadow: 0 3px 10px rgba(0,0,0,0.08);
+    }
+
+    /* 结果名称 */
+    div[data-testid="stMetricLabel"] {
+        font-weight: 700;
+        color: #44546A;
+    }
+
+    /* 结果数值 */
+    div[data-testid="stMetricValue"] {
+        font-size: 1.8rem;
+        font-weight: 800;
+        color: #005EB8;
+    }
+
+    /* Foundation model 区域 */
+    .model-note {
+        border: 1px solid #B4C7E7;
+        background: #F4F8FC;
+        color: #1F2937;
         border-radius: 10px;
         padding: .8rem 1rem;
         margin-bottom: .75rem;
-      }
-      .ready-box {
-        background: #13243b;
+    }
+
+    /* Ready */
+    .ready-box {
+        background: #EFF8EF;
+        border: 1px solid #70AD47;
         border-radius: 10px;
         padding: 1rem;
-        color: #77ffb7;
+        color: #385723;
         font-family: monospace;
         font-weight: 700;
-      }
+    }
+
+    /* Detailed Output */
+    textarea {
+        background: #FFFFFF !important;
+        color: #111827 !important;
+    }
+
     </style>
     """,
     unsafe_allow_html=True,
